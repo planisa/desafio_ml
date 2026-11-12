@@ -1,0 +1,87 @@
+name: Dependabot no Discord
+
+# Usa apenas o payload do evento; nenhum código do PR é executado.
+on:
+  pull_request_target:
+    types: [opened, reopened]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  notify:
+    name: Avisar sobre PR do Dependabot
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Enviar aviso ao Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DEPENDABOT_DISCORD_WEBHOOK_URL }}
+        shell: python
+        run: |
+          import json
+          import os
+          import random
+          import re
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+          from urllib.parse import urlsplit, urlunsplit
+
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          pr = event.get('pull_request')
+          if pr and pr.get('user', {}).get('login') != 'dependabot[bot]':
+              raise SystemExit('Evento ignorado: autor diferente do Dependabot.')
+          webhook = os.environ.get('DISCORD_WEBHOOK_URL', '').strip()
+          parts = urlsplit(webhook)
+          if (parts.scheme != 'https' or parts.hostname != 'discord.com'
+                  or parts.port not in (None, 443)
+                  or not re.fullmatch(r'/api/(?:v[0-9]+/)?webhooks/[0-9]+/[^/]+/?', parts.path)):
+              raise SystemExit('Secret DEPENDABOT_DISCORD_WEBHOOK_URL ausente ou inválido.')
+          repo = os.environ['GITHUB_REPOSITORY']
+          if pr:
+              status = 'PR reaberto' if event.get('action') == 'reopened' else 'Novo PR'
+              embed = {
+                  'title': (status + ' do Dependabot: ' + pr['title'])[:256],
+                  'url': pr['html_url'],
+                  'color': 3447003,
+                  'fields': [{'name': 'Repositório', 'value': repo, 'inline': True},
+                             {'name': 'PR', 'value': '#' + str(pr['number']), 'inline': True}],
+              }
+          else:
+              embed = {
+                  'title': 'Dependabot: teste de integração',
+                  'description': 'Alertas de PRs do Dependabot configurados para ' + repo + '.',
+                  'url': 'https://github.com/' + repo,
+                  'color': 3066993,
+              }
+          payload = json.dumps({'username': 'Planisa · Dependabot',
+                                'allowed_mentions': {'parse': []},
+                                'embeds': [embed]}).encode('utf-8')
+          url = urlunsplit((parts.scheme, parts.netloc, parts.path, 'wait=true', ''))
+          for attempt in range(5):
+              request = urllib.request.Request(url, data=payload, headers={
+                  'Content-Type': 'application/json',
+                  'User-Agent': 'Planisa-Dependabot-Notifications/1.0',
+              }, method='POST')
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      message = json.load(response)
+                      if not message.get('id'):
+                          raise SystemExit('Discord não confirmou a criação da mensagem.')
+                  print('Mensagem entregue ao Discord.')
+                  break
+              except urllib.error.HTTPError as error:
+                  if error.code != 429 or attempt == 4:
+                      raise SystemExit('Discord recusou o envio (HTTP ' + str(error.code) + ').')
+                  try:
+                      retry_after = float(json.loads(error.read()).get('retry_after', 2))
+                  except (ValueError, TypeError):
+                      retry_after = 2
+                  time.sleep(min(20, max(1, retry_after)) + random.uniform(0.1, 0.5))
+              except (urllib.error.URLError, TimeoutError, OSError):
+                  raise SystemExit('Falha de conexão ao enviar para o Discord.')
